@@ -12,6 +12,8 @@ import (
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/widget"
+
+	"URnetworkPC/pkg/urnetwork"
 )
 
 type ConnectionStatus int
@@ -39,18 +41,17 @@ func (s ConnectionStatus) String() string {
 }
 
 type URnetworkConfig struct {
-	DeviceID     string
-	ServerURL    string
-	ConnectRetry int
-	Timeout      time.Duration
+	DeviceID  string
+	ServerURL string
+	RelayID   string
+	Timeout   time.Duration
 }
 
 func DefaultConfig() *URnetworkConfig {
 	return &URnetworkConfig{
-		DeviceID:     generateDeviceID(),
-		ServerURL:    "wss://connect.urnetwork.io",
-		ConnectRetry: 3,
-		Timeout:      30 * time.Second,
+		DeviceID:  generateDeviceID(),
+		ServerURL: "wss://connect.urnetwork.io",
+		Timeout:   30 * time.Second,
 	}
 }
 
@@ -58,6 +59,7 @@ type URnetworkClient struct {
 	config      *URnetworkConfig
 	ctx         context.Context
 	cancel      context.CancelFunc
+	client      *urnetwork.Client
 	status      ConnectionStatus
 	statusMutex sync.RWMutex
 	logCallback func(string)
@@ -65,6 +67,7 @@ type URnetworkClient struct {
 	connMutex   sync.RWMutex
 	bytesIn     uint64
 	bytesOut    uint64
+	statsMutex  sync.RWMutex
 }
 
 func NewURnetworkClient(config *URnetworkConfig) *URnetworkClient {
@@ -118,8 +121,8 @@ func (c *URnetworkClient) setConnected(connected bool) {
 }
 
 func (c *URnetworkClient) GetStats() (bytesIn, bytesOut uint64) {
-	c.connMutex.RLock()
-	defer c.connMutex.RUnlock()
+	c.statsMutex.RLock()
+	defer c.statsMutex.RUnlock()
 	return c.bytesIn, c.bytesOut
 }
 
@@ -158,22 +161,84 @@ func (c *URnetworkClient) Connect() error {
 
 func (c *URnetworkClient) connectInternal() error {
 	c.log("Establishing connection to URnetwork...")
-	time.Sleep(500 * time.Millisecond)
+	c.log(fmt.Sprintf("Device ID: %s", c.config.DeviceID))
 
-	c.log("Performing handshake...")
-	time.Sleep(300 * time.Millisecond)
+	cfg := &urnetwork.Config{
+		DeviceID:  c.config.DeviceID,
+		ServerURL: c.config.ServerURL,
+		Timeout:   c.config.Timeout,
+	}
+
+	if c.config.RelayID != "" {
+		cfg.RelayID = c.config.RelayID
+		c.log(fmt.Sprintf("Using specific relay: %s", c.config.RelayID))
+	} else {
+		relays, err := urnetwork.GetRelays(c.ctx)
+		if err != nil {
+			return fmt.Errorf("failed to get available relays: %w", err)
+		}
+
+		if len(relays) == 0 {
+			return fmt.Errorf("no relays available")
+		}
+
+		c.log(fmt.Sprintf("Found %d available relays", len(relays)))
+		for i, relay := range relays {
+			c.log(fmt.Sprintf("  [%d] %s (%s) - Ping: %dms",
+				i+1, relay.Name, relay.Country, relay.PingMs))
+		}
+
+		bestRelay := relays[0]
+		cfg.RelayID = bestRelay.ID
+		c.log(fmt.Sprintf("Auto-selected best relay: %s (%s)",
+			bestRelay.Name, bestRelay.Country))
+	}
+
+	c.log("Initializing URnetwork SDK client...")
+	client, err := urnetwork.NewClient(cfg)
+	if err != nil {
+		return fmt.Errorf("failed to create URnetwork client: %w", err)
+	}
+
+	c.client = client
+
+	c.log("Performing handshake with relay...")
+	if err := c.client.Connect(c.ctx); err != nil {
+		return fmt.Errorf("connection failed: %w", err)
+	}
 
 	c.log("Authenticating device...")
-	time.Sleep(400 * time.Millisecond)
+	if err := c.client.Authenticate(c.ctx); err != nil {
+		return fmt.Errorf("authentication failed: %w", err)
+	}
 
 	c.log("Registering with network coordinator...")
-	time.Sleep(300 * time.Millisecond)
+	if err := c.client.Register(c.ctx); err != nil {
+		return fmt.Errorf("registration failed: %w", err)
+	}
 
-	c.log("Discovering peer nodes...")
-	time.Sleep(500 * time.Millisecond)
+	peers, err := c.client.GetPeers(c.ctx)
+	if err != nil {
+		c.log(fmt.Sprintf("Warning: could not retrieve peer list: %v", err))
+	} else {
+		c.log(fmt.Sprintf("Connected to %d peer nodes", len(peers)))
+		for i, peer := range peers {
+			if i < 5 {
+				c.log(fmt.Sprintf("  - Peer %d: %s (latency: %dms)",
+					i+1, peer.ID, peer.LatencyMs))
+			}
+		}
+		if len(peers) > 5 {
+			c.log(fmt.Sprintf("  ... and %d more peers", len(peers)-5))
+		}
+	}
 
-	numPeers := rand.Intn(5) + 3
-	c.log(fmt.Sprintf("Connected to %d peer nodes", numPeers))
+	c.client.OnStats(func(stats urnetwork.Stats) {
+		c.statsMutex.Lock()
+		c.bytesIn += stats.BytesIn
+		c.bytesOut += stats.BytesOut
+		c.statsMutex.Unlock()
+	})
 
 	c.log("Connection established successfully")
 	return nil
@@ -194,24 +259,40 @@ func (c *URnetworkClient) monitorConnection() {
 			if c.IsConnected() && c.GetStatus() == StatusConnected {
 				heartbeatCount++
 
-				c.connMutex.Lock()
-				c.bytesIn += uint64(rand.Intn(10000) + 1000)
-				c.bytesOut += uint64(rand.Intn(5000) + 500)
-				c.connMutex.Unlock()
-
 				bytesIn, bytesOut := c.GetStats()
-				c.log(fmt.Sprintf("Heartbeat #%d - Network active (↓ %s, ↑ %s)",
-					heartbeatCount,
-					formatBytes(bytesIn),
-					formatBytes(bytesOut)))
 
-				if heartbeatCount%3 == 0 {
-					numPeers := rand.Intn(3) + 3
-					c.log(fmt.Sprintf("Active connections: %d peers", numPeers))
+				if c.client != nil {
+					if status, err := c.client.GetStatus(c.ctx); err == nil {
+						c.log(fmt.Sprintf("Heartbeat #%d - Network active (↓ %s, ↑ %s) - Status: %s",
+							heartbeatCount,
+							formatBytes(bytesIn),
+							formatBytes(bytesOut),
+							status.State))
+					}
+
+					if heartbeatCount%3 == 0 {
+						if peers, err := c.client.GetPeers(c.ctx); err == nil {
+							c.log(fmt.Sprintf("Active connections: %d peers", len(peers)))
+						}
+					}
+				} else {
+					c.log(fmt.Sprintf("Heartbeat #%d - Network active (↓ %s, ↑ %s)",
+						heartbeatCount,
+						formatBytes(bytesIn),
+						formatBytes(bytesOut)))
 				}
 			}
 		}
 	}
+}
+
+func (c *URnetworkClient) GetRelays() ([]urnetwork.Relay, error) {
+	return urnetwork.GetRelays(c.ctx)
+}
+
+func (c *URnetworkClient) SetRelay(relayID string) {
+	c.config.RelayID = relayID
+	c.log(fmt.Sprintf("Relay selection changed to: %s", relayID))
 }
 
 func (c *URnetworkClient) Disconnect() error {
@@ -219,25 +300,30 @@ func (c *URnetworkClient) Disconnect() error {
 
 	c.setConnected(false)
 
+	if c.client != nil {
+		c.log("Closing peer connections...")
+
+		if err := c.client.Disconnect(c.ctx); err != nil {
+			c.log(fmt.Sprintf("Warning: disconnect error: %v", err))
+		}
+
+		c.log("Deregistering from network...")
+		c.client = nil
+	}
+
 	c.cancel()
-
-	time.Sleep(200 * time.Millisecond)
-	c.log("Closing peer connections...")
-
-	time.Sleep(200 * time.Millisecond)
-	c.log("Deregistering from network...")
-
-	c.setStatus(StatusDisconnected)
-	c.log("Disconnected successfully")
 
 	ctx, cancel := context.WithCancel(context.Background())
 	c.ctx = ctx
 	c.cancel = cancel
 
-	c.connMutex.Lock()
+	c.statsMutex.Lock()
 	c.bytesIn = 0
 	c.bytesOut = 0
-	c.connMutex.Unlock()
+	c.statsMutex.Unlock()
+
+	c.setStatus(StatusDisconnected)
+	c.log("Disconnected successfully")
 
 	return nil
 }
@@ -260,14 +346,16 @@ func formatBytes(bytes uint64) string {
 }
 
 type URnetworkGUI struct {
-	app           fyne.App
-	window        fyne.Window
-	client        *URnetworkClient
-	statusLabel   *widget.Label
-	statsLabel    *widget.Label
-	connectButton *widget.Button
-	logText       *widget.Entry
-	logMutex      sync.Mutex
+	app             fyne.App
+	window          fyne.Window
+	client          *URnetworkClient
+	statusLabel     *widget.Label
+	statsLabel      *widget.Label
+	connectButton   *widget.Button
+	relaySelect     *widget.Select
+	logText         *widget.Entry
+	logMutex        sync.Mutex
+	availableRelays []urnetwork.Relay
 }
 
 func NewURnetworkGUI() *URnetworkGUI {
@@ -298,6 +386,11 @@ func (g *URnetworkGUI) setupUI() {
 
 	clearLogsButton := widget.NewButton("Clear Logs", g.onClearLogsClick)
 
+	refreshRelaysButton := widget.NewButton("Refresh Relays", g.onRefreshRelaysClick)
+
+	g.relaySelect = widget.NewSelect([]string{"Auto (Best Relay)"}, g.onRelaySelected)
+	g.relaySelect.SetSelected("Auto (Best Relay)")
+
 	g.logText = widget.NewMultiLineEntry()
 	g.logText.SetPlaceHolder("Connection logs will appear here...")
 	g.logText.Wrapping = fyne.TextWrapWord
@@ -320,12 +413,19 @@ func (g *URnetworkGUI) setupUI() {
 	infoLabel := widget.NewLabel("💡 Click 'Connect' to join the URnetwork decentralized network")
 	infoLabel.Wrapping = fyne.TextWrapWord
 
+	relayLabel := widget.NewLabel("Relay Server:")
+	relayLabel.TextStyle = fyne.TextStyle{Bold: true}
+
 	content := container.NewVBox(
 		title,
 		subtitle,
 		widget.NewSeparator(),
 		g.statusLabel,
 		g.statsLabel,
+		container.NewVBox(
+			relayLabel,
+			container.NewBorder(nil, nil, nil, refreshRelaysButton, g.relaySelect),
+		),
 		container.NewHBox(
 			g.connectButton,
 			clearLogsButton,
@@ -337,7 +437,7 @@ func (g *URnetworkGUI) setupUI() {
 	)
 
 	g.window.SetContent(content)
-	g.window.Resize(fyne.NewSize(750, 600))
+	g.window.Resize(fyne.NewSize(750, 650))
 	g.window.CenterOnScreen()
 
 	g.window.SetOnClosed(func() {
@@ -347,6 +447,7 @@ func (g *URnetworkGUI) setupUI() {
 	})
 
 	go g.updateStatusLoop()
+	go g.loadAvailableRelays()
 }
 
 func (g *URnetworkGUI) appendLog(message string) {
@@ -410,6 +511,49 @@ func (g *URnetworkGUI) updateStats() {
 	}
 }
 
+func (g *URnetworkGUI) loadAvailableRelays() {
+	g.appendLog("Fetching available relays...")
+	relays, err := g.client.GetRelays()
+	if err != nil {
+		g.appendLog(fmt.Sprintf("Failed to load relays: %v", err))
+		return
+	}
+
+	g.availableRelays = relays
+	options := []string{"Auto (Best Relay)"}
+	for _, relay := range relays {
+		option := fmt.Sprintf("%s (%s) - %dms", relay.Name, relay.Country, relay.PingMs)
+		options = append(options, option)
+	}
+
+	g.relaySelect.Options = options
+	g.relaySelect.Refresh()
+	g.appendLog(fmt.Sprintf("Loaded %d available relays", len(relays)))
+}
+
+func (g *URnetworkGUI) onRefreshRelaysClick() {
+	go g.loadAvailableRelays()
+}
+
+func (g *URnetworkGUI) onRelaySelected(option string) {
+	if option == "Auto (Best Relay)" {
+		g.client.SetRelay("")
+		g.appendLog("Relay selection: Auto (Best Relay)")
+		return
+	}
+
+	for i, relay := range g.availableRelays {
+		expectedOption := fmt.Sprintf("%s (%s) - %dms", relay.Name, relay.Country, relay.PingMs)
+		if option == expectedOption {
+			g.client.SetRelay(relay.ID)
+			g.appendLog(fmt.Sprintf("Relay selection: %s (ID: %s)", relay.Name, relay.ID))
+			break
+		} else if i == len(g.availableRelays)-1 {
+			g.appendLog(fmt.Sprintf("Warning: Selected relay not found: %s", option))
+		}
+	}
+}
+
 func (g *URnetworkGUI) updateUIStatus(status ConnectionStatus) {
 	statusText := "Status: " + status.String()
 	if status == StatusConnected {
@@ -422,22 +566,27 @@ func (g *URnetworkGUI) updateUIStatus(status ConnectionStatus) {
 		g.connectButton.SetText("Connect to URnetwork")
 		g.connectButton.Enable()
 		g.connectButton.Importance = widget.HighImportance
+		g.relaySelect.Enable()
 	case StatusConnecting:
 		g.connectButton.SetText("Connecting...")
 		g.connectButton.Disable()
+		g.relaySelect.Disable()
 	case StatusConnected:
 		g.connectButton.SetText("Disconnect")
 		g.connectButton.Enable()
 		g.connectButton.Importance = widget.MediumImportance
+		g.relaySelect.Disable()
 	case StatusError:
 		g.connectButton.SetText("Retry Connection")
 		g.connectButton.Enable()
 		g.connectButton.Importance = widget.DangerImportance
+		g.relaySelect.Enable()
 	}
 
 	g.connectButton.Refresh()
 	g.statusLabel.Refresh()
 	g.statsLabel.Refresh()
+	g.relaySelect.Refresh()
 }
 
 func (g *URnetworkGUI) Run() {
